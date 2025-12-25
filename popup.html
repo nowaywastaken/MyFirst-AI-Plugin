@@ -27,11 +27,15 @@
   </style>
 </head>
 <body>
-  <h3>✍️ 小万的 AI 嘴替</h3>
+  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+    <h3 style="margin: 0;">✍️ 小万的 AI 嘴替</h3>
+    <button id="settingsBtn" style="background: none; border: none; font-size: 20px; width: auto; padding: 0; cursor: pointer;">⚙️</button>
+  </div>
   
   <textarea id="userPrompt" placeholder="比如：帮我写个请假条，或者是搜索 M3 MacBook 评测..."></textarea>
   
   <button id="writeBtn">让 AI 生成并填写</button>
+  <button id="stopBtn" style="background-color: #FF3B30; display: none; margin-top: 5px;">⏹ 停止当前任务</button>
   
   <div id="status">准备就绪</div>
 

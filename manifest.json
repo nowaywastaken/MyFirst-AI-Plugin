@@ -3,8 +3,13 @@
   "name": "小万的AI阅读助手",
   "version": "1.0",
   "description": "帮我提取网页内容并总结",
-  "permissions": ["activeTab", "scripting", "storage"],
+  "permissions": ["activeTab", "scripting", "storage", "alarms"],
   "action": {
     "default_popup": "popup.html"
-  }
+  },
+  "options_page": "options.html",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": ["<all_urls>"]
 }
