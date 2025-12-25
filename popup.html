@@ -35,6 +35,15 @@
   
   <div id="status">准备就绪</div>
 
+  <!-- 🎒 Memory Backpack Section -->
+  <div style="margin-top: 15px; border-top: 1px dashed #ccc; padding-top: 10px;">
+    <button id="toggleMemoryBtn" style="background-color: #007AFF; margin-bottom: 5px;">🎒 我的记忆背包</button>
+    <div id="memoryArea" style="display: none;">
+      <textarea id="memoryContent" placeholder="在这里写下你的个人信息（姓名、电话、地址等），AI 会记住它们..." style="height: 100px; font-size: 12px;"></textarea>
+      <button id="saveMemoryBtn" style="background-color: #FF9500; font-size: 12px; padding: 5px;">💾 保存记忆</button>
+    </div>
+  </div>
+
   <script src="popup.js"></script>
 </body>
 </html>

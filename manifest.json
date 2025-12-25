@@ -3,7 +3,7 @@
   "name": "小万的AI阅读助手",
   "version": "1.0",
   "description": "帮我提取网页内容并总结",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": ["activeTab", "scripting", "storage"],
   "action": {
     "default_popup": "popup.html"
   }

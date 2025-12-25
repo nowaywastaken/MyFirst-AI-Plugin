@@ -7,6 +7,40 @@ const writeBtn = document.getElementById("writeBtn");
 const userPrompt = document.getElementById("userPrompt");
 const statusDiv = document.getElementById("status");
 
+// === 🎒 记忆背包 UI 元素 ===
+const toggleMemoryBtn = document.getElementById("toggleMemoryBtn");
+const memoryArea = document.getElementById("memoryArea");
+const memoryContent = document.getElementById("memoryContent");
+const saveMemoryBtn = document.getElementById("saveMemoryBtn");
+
+// 初始化：加载记忆
+chrome.storage.local.get(["userMemory"], (result) => {
+  if (result.userMemory) {
+    memoryContent.value = result.userMemory;
+  }
+});
+
+// 切换显示背包
+toggleMemoryBtn.addEventListener("click", () => {
+    if (memoryArea.style.display === "none") {
+        memoryArea.style.display = "block";
+        toggleMemoryBtn.innerText = "🎒 收起背包";
+    } else {
+        memoryArea.style.display = "none";
+        toggleMemoryBtn.innerText = "🎒 我的记忆背包";
+    }
+});
+
+// 保存记忆
+saveMemoryBtn.addEventListener("click", () => {
+    const memoryText = memoryContent.value;
+    chrome.storage.local.set({ userMemory: memoryText }, () => {
+        const originalText = saveMemoryBtn.innerText;
+        saveMemoryBtn.innerText = "✅ 已保存";
+        setTimeout(() => { saveMemoryBtn.innerText = originalText; }, 1000);
+    });
+});
+
 writeBtn.addEventListener("click", async () => {
   const prompt = userPrompt.value;
   if (!prompt) {
@@ -39,16 +73,22 @@ writeBtn.addEventListener("click", async () => {
         buttons: pageData.buttons
     });
     
+    // 获取记忆背包内容
+    const memoryData = await chrome.storage.local.get(["userMemory"]);
+    const userMemory = memoryData.userMemory || "（用户暂无存储的个人信息）";
+
     const fullPrompt = `
       【网页背景文字】：${bgText}
       
       【网页UI元素清单】：${uiContext}
       
+      【用户记忆背包】：${userMemory}
+
       【用户指令】：${prompt}
       
       【任务】：
       1. 分析用户意图和网页内容。
-      2. 决定需要填写的输入框 (fill)。
+      2. 结合【用户记忆背包】中的信息，决定需要填写的输入框 (fill)。如果用户要求填写的信息在背包里能找到，请优先使用背包里的信息。
       3. 决定填写完毕后需要点击的按钮 (click)。请找到最像“提交/登录/搜索/下一步”的那个按钮。
       
       【输出格式】：
