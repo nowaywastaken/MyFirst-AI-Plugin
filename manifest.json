@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "小万的AI阅读助手",
+  "name": "Zeroutine Extension",
   "version": "1.0",
-  "description": "帮我提取网页内容并总结",
+  "description": "AI-powered browser automation and intelligent web agent",
   "permissions": ["activeTab", "scripting", "storage", "alarms"],
   "action": {
     "default_popup": "popup.html"
