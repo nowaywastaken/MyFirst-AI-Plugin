@@ -3,7 +3,7 @@
   "name": "Zeroutine Extension",
   "version": "1.0",
   "description": "AI-powered browser automation and intelligent web agent",
-  "permissions": ["activeTab", "scripting", "storage", "alarms"],
+  "permissions": ["activeTab", "scripting", "storage", "alarms", "webNavigation"],
   "action": {
     "default_popup": "popup.html"
   },

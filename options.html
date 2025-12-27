@@ -74,15 +74,35 @@
     }
     .badge-on { background: #34C759; color: white; }
     .badge-off { background: #999; color: white; }
+    
+    .history-list {
+        max-height: 150px; overflow-y: auto; background: #fff; border: 1px solid #eee;
+        margin: 10px 0; border-radius: 4px; display: none;
+    }
+    .history-item {
+        padding: 8px; border-bottom: 1px solid #f0f0f0; display: flex; 
+        justify-content: space-between; align-items: center; font-size: 12px;
+    }
+    .history-item:last-child { border-bottom: none; }
+    .history-meta { color: #888; }
   </style>
 </head>
 <body>
   <h2>⚙️ 插件设置</h2>
   
   <div class="form-group">
-    <label for="apiKey">OpenRouter API Key</label>
-    <input type="password" id="apiKey" placeholder="sk-or-v1-...">
-    <div class="hint">您的 Key 将仅保存在本地 Chrome Storage 中，不会发送给第三方。</div>
+    <label for="apiKey">API Key (OpenRouter/OpenAI/Other)</label>
+    <input type="password" id="apiKey" placeholder="sk-...">
+    
+    <label for="providerUrl" style="margin-top:10px;">Model Provider URL</label>
+    <input type="text" id="providerUrl" class="input-sm" placeholder="https://openrouter.ai/api/v1/chat/completions">
+    <div class="hint">Default: OpenRouter. For LocalAI/Ollama use: http://localhost:11434/v1/chat/completions</div>
+
+    <label for="modelName" style="margin-top:10px;">Model Name</label>
+    <input type="text" id="modelName" class="input-sm" placeholder="google/gemini-2.5-flash">
+    <div class="hint">e.g. gpt-4o, deepseek-r1, llama3.2</div>
+
+    <div class="hint" style="margin-top:10px;">您的 Key 和配置仅保存在本地 Chrome Storage 中。</div>
   </div>
 
   <button id="saveBtn">保存设置</button>

@@ -7,11 +7,40 @@ const API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 // =========================================
 // 0. 初始化：防止“假死” (每次插件重载都强制重置)
 // =========================================
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(async () => {
+    // 0. 初始化基础状态
     chrome.storage.local.set({ 
-        "agentState": { active: false, stepInfo: "🚀 扩展已就绪", waitingForLoad: false, actionHistory: [] },
-        "userScripts": [] // 🔌 Init Script Storage
+        "agentState": { active: false, stepInfo: "🚀 扩展已就绪", waitingForLoad: false, actionHistory: [] }
     });
+    
+    // 🔌 Migration Logic (V1 Array -> V2 Split)
+    // Check if we need migration
+    const { userScripts } = await chrome.storage.local.get("userScripts");
+    if (userScripts && userScripts.length > 0) {
+        // Check if the first script has 'code' property directly
+        if (typeof userScripts[0].code === 'string') {
+            console.log("⚙️ Starting Storage Migration (V1 -> V2)...");
+            const newMeta = [];
+            const writes = {};
+            
+            for (const script of userScripts) {
+                const codeKey = `ujs_${script.id}`;
+                writes[codeKey] = script.code;
+                
+                // Create metadata object (without code)
+                const { code, ...meta } = script;
+                newMeta.push(meta);
+            }
+            
+            writes["userScripts"] = newMeta;
+            await chrome.storage.local.set(writes);
+            console.log("✅ Storage Migration Completed!");
+        }
+    } else if (!userScripts) {
+        // Initialize empty if not exists
+        await chrome.storage.local.set({ "userScripts": [] });
+    }
+
     chrome.alarms.clearAll();
 });
 
@@ -144,73 +173,232 @@ async function handleScriptRepair(tabId, scriptId, complaint) {
     if (!jsonMatch) throw new Error("AI returned invalid JSON");
     const data = JSON.parse(jsonMatch[0]);
 
-    // 5. Update with Versioning
-    if (!script.history) script.history = [];
-    script.history.push({ 
-        code: script.code, 
+    // 5. Update with Versioning (Split Storage)
+    // Fetch full script code first because 'script' here is just metadata (if coming from UI list)
+    // OR if coming from internal flow it might not have code yet.
+    // Actually handleScriptRepair is called with scriptId.
+    
+    // Re-fetch to be safe
+    const { userScripts: currentScripts } = await chrome.storage.local.get("userScripts");
+    const freshScriptIdx = currentScripts.findIndex(s => s.id === scriptId);
+    if (freshScriptIdx === -1) throw new Error("Script gone");
+    
+    let freshScript = currentScripts[freshScriptIdx];
+    
+    // Get old code to save in history
+    const oldCodeMap = await chrome.storage.local.get(`ujs_${scriptId}`);
+    const oldCode = oldCodeMap[`ujs_${scriptId}`] || "";
+
+    if (!freshScript.history) freshScript.history = [];
+    freshScript.history.push({ 
+        code: oldCode, 
         timestamp: Date.now(), 
         reason: "Before Repair: " + complaint 
     });
     
-    script.code = data.code;
-    script.updatedAt = Date.now();
+    freshScript.updatedAt = Date.now();
     
-    userScripts[scriptIdx] = script;
-    await chrome.storage.local.set({ userScripts });
+    // Save Code separately
+    const writes = {};
+    writes[`ujs_${scriptId}`] = data.code;
+    
+    // Update Metadata
+    currentScripts[freshScriptIdx] = freshScript;
+    writes["userScripts"] = currentScripts;
+    
+    await chrome.storage.local.set(writes);
     
     return true;
 }
 
 async function handleScriptGeneration(tabId, url, userPrompt) {
-    // 1. 获取页面上下文
+    // 0. Inject Tools (ALL FRAMES)
+    try {
+        await chrome.scripting.executeScript({
+            target: { tabId, allFrames: true },
+            files: ["lib/dom_tools.js"]
+        });
+    } catch (e) { console.error("Tool injection failed", e); }
+
+    // 1. Initial Analysis (Quick overview)
     let pageData = { text: "" };
     try {
         const result = await chrome.scripting.executeScript({ target: { tabId }, function: analyzePageElements });
         pageData = result[0].result;
     } catch (e) { console.error("Analysis failed", e); }
 
-    // 2. 构建 Prompt
-    const prompt = `
-    Context:
-    URL: ${url}
-    Page Text (snippet): ${pageData.text.substring(0, 1000)}
-    Page structure includes inputs: ${JSON.stringify(pageData.inputs)}
-    
-    User Request: Create a Tampermonkey-style Javascript script to: "${userPrompt}"
-    
-    Requirements:
-    1. The code should be valid Javascript.
-    2. It should run on the document context.
-    3. Return ONLY a JSON object:
-    {
-      "name": "Short Script Name",
-      "code": "document.body.style.background = 'black';", 
-      "explanation": "Brief explanation"
-    }
-    `;
-
-    // 3. Call AI
-    const aiResp = await callAI(prompt, "json_object");
-    const jsonMatch = aiResp.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("AI returned invalid JSON");
-    
-    const data = JSON.parse(jsonMatch[0]);
-    
-    // 4. Save to Storage
+    // 1.5. Get Existing Context
     const { userScripts } = await chrome.storage.local.get("userScripts");
-    const newScripts = userScripts || [];
+    const existingList = (userScripts || []).map(s => `- ${s.name} (Matches: ${s.matches})`).join("\n");
+
+    // === INTERACTIVE LOOP ===
+    const MAX_TURNS = 50; 
+    let history = [];
+    let recentActions = []; // Queue for loop detection (size 3)
+    let finalCode = "";
+    let finalExplanation = "";
+
+    for (let i = 0; i < MAX_TURNS; i++) {
+        console.log(`🔄 Turn ${i + 1}/${MAX_TURNS}`);
+        
+        // --- 1. Token Safety: Truncate History if too long ---
+        // Naive estimation: 1 char ~= 0.25 tokens (conservative), or just char count limits.
+        // Let's keep total prompt reasonable (< 12000 chars approx 3k tokens + overhead)
+        const historyChars = history.reduce((acc, h) => acc + h.content.length, 0);
+        if (historyChars > 12000) {
+            // Remove roughly top 20% of history (skipping first few if possible, but keep it simple)
+            // Just splice the middle
+             const removeCount = Math.floor(history.length * 0.2);
+             if (removeCount > 0) {
+                 history.splice(1, removeCount, { role: "system", content: `[... Removed ${removeCount} earlier steps to save memory ...]` });
+             }
+        }
+
+        // --- 2. Construct Prompt ---
+        const prompt = `
+        Context:
+        URL: ${url}
+        Page Title: ${pageData.title || "Unknown"}
+        Initial Text Snippet: ${pageData.text.substring(0, 500)}...
+        
+        Task: Create a Tampermonkey-style Javascript script to: "${userPrompt}"
+        
+        Tools Available:
+        - SEARCH_TEXT(query): Find elements containing text. Returns list with classes/IDs.
+        - INSPECT_SELECTOR(selector): Get details (HTML/parent) of a specific selector.
+        - FINISH(code, explanation): Submit the final script.
+        
+        History:
+        ${history.map(h => `[${h.role}]: ${h.content}`).join("\n")}
+        
+        Instructions:
+        1. If you don't know the exact class name for ads or elements, use SEARCH_TEXT first!
+        2. Inspect candidates to verify structure before writing code.
+        3. Even if you think you know, verify.
+        4. Return ONLY a JSON object:
+        {
+            "tool": "SEARCH_TEXT" | "INSPECT_SELECTOR" | "FINISH",
+            "arg": "search_query_or_selector",
+            "code": "final_code_if_finish", 
+            "explanation": "thought_process"
+        }
+        `;
+
+        // Call AI
+        const aiResp = await callAI(prompt, "json_object");
+        console.log("AI Resp:", aiResp);
+        
+        let action;
+        try {
+            const jsonMatch = aiResp.match(/\{[\s\S]*\}/);
+            action = JSON.parse(jsonMatch[0]);
+        } catch (e) {
+            console.error("JSON Parse Error", e);
+            history.push({ role: "system", content: "Error: Invalid JSON format. Please try again." });
+            continue;
+        }
+
+        // --- 3. Loop Detection ---
+        const actionSig = `${action.tool}:${action.arg}`;
+        recentActions.push(actionSig);
+        if (recentActions.length > 3) recentActions.shift();
+
+        // Check if last 3 actions are identical
+        if (recentActions.length === 3 && recentActions.every(s => s === actionSig) && action.tool !== "FINISH") {
+             console.warn("⚠️ Loop detected!", actionSig);
+             history.push({ role: "system", content: "WARNING: You are repeating the same action repeatedly. Try a different query, or use FINISH if you are stuck." });
+             // Do not execute tool, just feedback
+             continue;
+        }
+
+        // Execute Tool
+        if (action.tool === "FINISH") {
+            finalCode = action.code;
+            finalExplanation = action.explanation;
+            break;
+        } else if (action.tool === "SEARCH_TEXT") {
+            // Updated to scan ALL FRAMES
+            const res = await chrome.scripting.executeScript({
+                target: { tabId, allFrames: true },
+                func: (q) => window.tool_search_text(q),
+                args: [action.arg]
+            });
+            
+            // Rewrite standard output to combine frames
+            // res is array: [{frameId: 0, result: ...}, {frameId: 123, result: ...}]
+            let combinedResults = [];
+            res.forEach(frameRes => {
+                if (frameRes.result && frameRes.result.results && frameRes.result.results.length > 0) {
+                    frameRes.result.results.forEach(item => {
+                        item.frameId = frameRes.frameId; // Tag result with frame
+                        combinedResults.push(item);
+                    });
+                }
+            });
+            
+            history.push({ role: "assistant", content: `Tool: SEARCH_TEXT("${action.arg}")` });
+            history.push({ role: "system", content: `Found ${combinedResults.length} matches in ${res.length} frames:\n${JSON.stringify(combinedResults).substring(0, 3000)}` }); 
+        } else if (action.tool === "INSPECT_SELECTOR") {
+            const res = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: (s) => window.tool_inspect_selector(s),
+                args: [action.arg]
+            });
+            const output = res[0].result;
+            history.push({ role: "assistant", content: `Tool: INSPECT_SELECTOR("${action.arg}")` });
+            history.push({ role: "system", content: `Result: ${JSON.stringify(output).substring(0, 1500)}` });
+        } else {
+             history.push({ role: "system", content: "Error: Unknown tool. Use SEARCH_TEXT, INSPECT_SELECTOR, or FINISH." });
+        }
+    }
+
+
     
-    const newScript = {
-        id: crypto.randomUUID(),
-        name: data.name || "AI Generated Script",
-        matches: url.split('?')[0] + "*", // Default to current URL pattern
-        code: data.code,
+    // Fallback: If no code generated after max turns, Force Finish.
+    if (!finalCode) {
+        console.warn("⚠️ Max turns reached. Forcing conclusion.");
+        const forcePrompt = `
+        You have run out of turns.
+        Based on the history above, generate the BEST POSSIBLE script now.
+        Do not ask for more info.
+        Return ONLY JSON with "tool": "FINISH".
+        `;
+        
+        try {
+            const aiResp = await callAI(forcePrompt + "\nHistory:\n" + history.map(h => `[${h.role}]: ${h.content}`).join("\n"), "json_object");
+            const jsonMatch = aiResp.match(/\{[\s\S]*\}/);
+            const action = JSON.parse(jsonMatch[0]);
+            if (action.tool === "FINISH") {
+                finalCode = action.code;
+                finalExplanation = action.explanation || "Forced generation after timeout";
+            }
+        } catch(e) { console.error("Force finish failed", e); }
+    }
+
+    if (!finalCode) {
+        throw new Error("AI failed to generate code even after forced finish.");
+    }
+    
+    // 4. Save to Storage (Split)
+    const { userScripts: currentScripts } = await chrome.storage.local.get("userScripts");
+    const newScripts = currentScripts || [];
+    
+    const scriptId = crypto.randomUUID();
+    const newScriptMeta = {
+        id: scriptId,
+        name: finalExplanation ? finalExplanation.substring(0, 20) : "AI Script",
+        matches: url.split('?')[0] + "*", 
         enabled: true,
         createdAt: Date.now()
     };
     
-    newScripts.push(newScript);
-    await chrome.storage.local.set({ userScripts: newScripts });
+    newScripts.push(newScriptMeta);
+    
+    const writes = {};
+    writes["userScripts"] = newScripts;
+    writes[`ujs_${scriptId}`] = finalCode;
+    
+    await chrome.storage.local.set(writes);
     
     // 5. Run Immediately
     chrome.scripting.executeScript({
@@ -221,7 +409,7 @@ async function handleScriptGeneration(tabId, url, userPrompt) {
              (document.head || document.documentElement).appendChild(scriptEl);
              scriptEl.remove();
         },
-        args: [newScript.code],
+        args: [finalCode],
         world: "MAIN"
     }).catch(e => console.error("Immediate run failed", e));
     
@@ -229,54 +417,61 @@ async function handleScriptGeneration(tabId, url, userPrompt) {
 }
 
 // 2. 监听页面加载完成 (用于跨页面任务)
-// 2. 监听页面加载完成 (用于跨页面任务 & 🔌 脚本注入)
+// 2. 监听页面加载 (Faster Injection: document_start)
+// Using webNavigation.onCommitted to inject as early as possible
+chrome.webNavigation.onCommitted.addListener(async (details) => {
+    // Only inject into the main frame for now (frameId 0)
+    // To support iframes, we would need to check match patterns against details.url
+    if (details.frameId !== 0) return;
+
+    try {
+        const { userScripts } = await chrome.storage.local.get("userScripts");
+        if (userScripts && userScripts.length > 0) {
+            const matchedScripts = userScripts.filter(script => {
+                if (!script.enabled) return false;
+                // Simple wildcard matching
+                const pattern = script.matches.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*');
+                const regex = new RegExp(`^${pattern}$`);
+                return regex.test(details.url);
+            });
+
+            if (matchedScripts.length > 0) {
+                console.log(`⚡️ [FastInject] Found ${matchedScripts.length} scripts for ${details.url}`);
+                
+                // Load codes
+                const keys = matchedScripts.map(s => `ujs_${s.id}`);
+                const codeMap = await chrome.storage.local.get(keys);
+                
+                matchedScripts.forEach(script => {
+                    const code = codeMap[`ujs_${script.id}`];
+                    if (!code) return;
+
+                    chrome.scripting.executeScript({
+                        target: { tabId: details.tabId },
+                        func: (code) => {
+                            try {
+                                const scriptEl = document.createElement('script');
+                                scriptEl.textContent = code;
+                                // Inject immediately
+                                (document.head || document.documentElement).appendChild(scriptEl);
+                                scriptEl.remove();
+                            } catch(e) { console.error("Script Error:", e); }
+                        },
+                        args: [code],
+                        world: "MAIN",
+                        injectImmediately: true // Key for document_start emulation
+                    }).catch(err => console.error("Injection failed:", err));
+                });
+            }
+        }
+    } catch (e) { console.error("Script Check Error:", e); }
+});
+
+// onUpdated 仅用于 UI 状态维护 (Overlay) 和 Agent 逻辑
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete') {
-      // A. 🔌 Tampermonkey 核心: 检查并注入用户脚本
-      try {
-          const { userScripts } = await chrome.storage.local.get("userScripts");
-          if (userScripts && userScripts.length > 0) {
-              const matchedScripts = userScripts.filter(script => {
-                  if (!script.enabled) return false;
-                  // Simple wildcard matching: *://example.com/*
-                  // Convert wildcard to regex for basic support
-                  const pattern = script.matches.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*');
-                  const regex = new RegExp(`^${pattern}$`);
-                  return regex.test(tab.url);
-              });
-
-              if (matchedScripts.length > 0) {
-                  console.log(`🔌 Found ${matchedScripts.length} scripts for ${tab.url}`);
-                  matchedScripts.forEach(script => {
-                       chrome.scripting.executeScript({
-                           target: { tabId: tabId },
-                           func: (code) => {
-                               // Wrap in IIFE to avoid pollution
-                               try {
-                                   console.log("🔌 running custom script...");
-                                   // Note: 'code' here is passed as string, but we can't eval easily in SW context depending on CSP.
-                                   // In executeScript func, the args are passed. 
-                                   // Actually, passing code as string to 'func' isn't how it works best. 
-                                   // Better to use 'function' injection or 'files'.
-                                   // But for dynamic code string, we might need a different approach or simplified eval if allowed.
-                                   // Since we are in the context of the page, we can use new Function or eval IF the page CSP allows it.
-                                   // A safer way for MV3 is maybe just passing the function body if we control it, 
-                                   // but user scripts are arbitrary strings.
-                                   // workaround: inject a script tag
-                                   const scriptEl = document.createElement('script');
-                                   scriptEl.textContent = code;
-                                   (document.head || document.documentElement).appendChild(scriptEl);
-                                   scriptEl.remove();
-                               } catch(e) { console.error("Script Error:", e); }
-                           },
-                           args: [script.code],
-                           world: "MAIN" // Inject into main world to access window objects easily
-                       }).catch(err => console.error("Injection failed:", err));
-                  });
-              }
-          }
-      } catch (e) { console.error("Script Check Error:", e); }
-
+      // 🔌 scripts are now injected via webNavigation (Phase 1 Task 3)
+      
       // B. 🤖 AI Agent 恢复逻辑
       // Service Worker 恢复
       if (!globalState.active) {
@@ -647,29 +842,33 @@ function executeActionPlan(action) {
 // ==========================================
 // 🧠 AI (复用)
 // ==========================================
-async function callAI(prompt) {
-  const { apiKey } = await chrome.storage.local.get("apiKey");
+async function callAI(prompt, format = "json_object") {
+  const { apiKey, providerUrl, modelName } = await chrome.storage.local.get(["apiKey", "providerUrl", "modelName"]);
+  
   if (!apiKey) {
       throw new Error("❌ 未配置 API Key。请点击右上角⚙️图标进行设置。");
   }
+  
+  const API_ENDPOINT = providerUrl || "https://openrouter.ai/api/v1/chat/completions";
+  const MODEL_ID = modelName || "google/gemini-2.5-flash";
 
-  const response = await fetch(API_URL, {
+  const response = await fetch(API_ENDPOINT, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      // "Authorization": `Bearer ${API_KEY}`,
       "Authorization": `Bearer ${apiKey}`,
       "HTTP-Referer": "https://localhost:3000",
     },
     body: JSON.stringify({
-      model: "google/gemini-2.5-flash",
-      response_format: { type: "json_object" }, 
+      model: MODEL_ID,
+      response_format: { type: format }, 
       messages: [
         { role: "system", content: "你是一个自动化操作助手。请输出纯 JSON。" },
         { role: "user", content: prompt }
       ]
     })
   });
+  
   const data = await response.json();
   if (data.error) throw new Error(data.error.message);
   return data.choices[0].message.content;
