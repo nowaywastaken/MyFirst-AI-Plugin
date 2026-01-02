@@ -782,13 +782,24 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 async function runAgentLoop() {
   if (!globalState.active) return;
 
-  // 防止无限递归
-  if (globalState.actionHistory.length > 20) {
+  // 防止无限递归 (扩展到50步)
+  const MAX_STEPS = 50;
+  if (globalState.actionHistory.length > MAX_STEPS) {
       globalState.stepInfo = "❌ 任务步骤过多，强制停止防止死循环。";
       globalState.active = false;
       saveState();
       chrome.tabs.sendMessage(globalState.tabId, { type: "UPDATE_OVERLAY", text: globalState.stepInfo }).catch(() => {});
       return;
+  }
+  
+  // 历史压缩：当历史超过30条时，压缩旧记录
+  if (globalState.actionHistory.length > 30) {
+      const oldHistory = globalState.actionHistory.slice(0, -20);
+      const recentHistory = globalState.actionHistory.slice(-20);
+      const summary = `[Compressed ${oldHistory.length} steps]: ` + 
+          oldHistory.map(h => h.thought?.substring(0, 30)).join(' → ');
+      globalState.actionHistory = [{ thought: summary, action: { note: 'compressed' } }, ...recentHistory];
+      saveState();
   }
 
   try {
@@ -992,61 +1003,111 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 function analyzePageElements() {
   const bodyText = document.body.innerText;
   
-  // 简易的“等待”逻辑在 content script 里不好做同步 sleep
-  // 所以我们只负责准确抓取。如果抓不到，Background 会决定是否重试。
+  // 可见性检查辅助函数
+  function isVisible(el) {
+      if (!el) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+  }
+  
+  // 生成稳定选择器
+  function buildSelector(el) {
+      if (!el) return null;
+      // 优先级: data-testid > id > name > aria-label > class组合
+      const testId = el.getAttribute('data-testid') || el.getAttribute('data-test');
+      if (testId) return `[data-testid="${testId}"]`;
+      if (el.id) return `#${el.id}`;
+      if (el.name) return `[name="${el.name}"]`;
+      const ariaLabel = el.getAttribute('aria-label');
+      if (ariaLabel) return `[aria-label="${ariaLabel}"]`;
+      // 回退到标签+类名
+      let sel = el.tagName.toLowerCase();
+      if (el.className && typeof el.className === 'string') {
+          const classes = el.className.split(/\s+/).filter(c => c && !c.includes(':'));
+          if (classes.length > 0) sel += '.' + classes.slice(0, 2).join('.');
+      }
+      return sel;
+  }
 
-  const inputEls = document.querySelectorAll('input, textarea');
+  const inputEls = document.querySelectorAll('input, textarea, select');
   const inputList = [];
   inputEls.forEach((el) => {
-    if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button' || el.type === 'image' || el.disabled) return;
-    // 增加可见性判断：如果 display:none 或者 visibility:hidden，忽略
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden') return;
+    if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button' || el.type === 'image') return;
+    if (!isVisible(el)) return;
     
+    const selector = buildSelector(el);
     inputList.push({
         key: el.name || el.id || ("idx_" + inputList.length), 
         placeholder: el.placeholder || "",
-        label: el.previousElementSibling?.innerText || "" 
+        label: el.previousElementSibling?.innerText?.substring(0, 30) || "",
+        type: el.type || el.tagName.toLowerCase(),
+        selector: selector,
+        disabled: el.disabled,
+        value: el.value?.substring(0, 20) || ""
     });
   });
 
   const btnList = [];
+  const seenElements = new WeakSet();
   
-  // 1. 标准按钮
-  document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn, div[role="button"]').forEach((el, index) => {
-    // 必须有 offsetParent 才是可见的
-    if (el.offsetParent === null) return; 
-    
-    let btnText = el.innerText || el.value || el.title || "";
-    btnText = btnText.substring(0, 20).replace(/\n/g, "");
-    if(btnText.trim().length < 1) return; 
-
-    btnList.push({
-        key: el.id || el.name || ("btn_idx_" + index), 
-        text: btnText
-    });
+  // 1. 标准按钮 + role="button" + 链接按钮
+  const btnSelectors = [
+      'button:not([disabled])',
+      'input[type="submit"]:not([disabled])',
+      'input[type="button"]:not([disabled])',
+      '[role="button"]',
+      'a[href]',
+      '[onclick]'
+  ];
+  
+  btnSelectors.forEach(sel => {
+      document.querySelectorAll(sel).forEach((el, index) => {
+          if (seenElements.has(el)) return;
+          if (!isVisible(el)) return;
+          
+          seenElements.add(el);
+          
+          let btnText = el.innerText || el.value || el.title || el.getAttribute('aria-label') || "";
+          btnText = btnText.substring(0, 30).replace(/\n/g, " ").trim();
+          if (btnText.length < 1) return;
+          
+          const selector = buildSelector(el);
+          btnList.push({
+              key: el.id || el.name || selector || ("btn_idx_" + btnList.length),
+              text: btnText,
+              tagName: el.tagName,
+              selector: selector,
+              type: el.type || el.getAttribute('role') || 'link'
+          });
+      });
   });
 
-  // 2. 🔍 重点：搜索结果链接 (通常在 h3 里面)
-  document.querySelectorAll('h3 a, h3').forEach((el, index) => {
-      // 这里的逻辑稍微宽泛一点，把 h3 里的文字当按钮
-      let aTag = el.tagName === 'A' ? el : el.querySelector('a');
-      let t = el.innerText.substring(0, 50).replace(/\n/g, "");
-      if(t.trim().length > 0) {
-          // 如果是 a 标签，最好用 href 做 key 的一部分防止重复? 不用了，还是用 dom 索引稳妥
+  // 2. 🔍 搜索结果链接 (h1-h3 里的链接)
+  document.querySelectorAll('h1 a, h2 a, h3 a').forEach((el, index) => {
+      if (seenElements.has(el)) return;
+      seenElements.add(el);
+      
+      let t = el.innerText.substring(0, 50).replace(/\n/g, " ").trim();
+      if (t.length > 0 && isVisible(el)) {
+          const selector = buildSelector(el);
           btnList.push({ 
-              key: "link_res_" + index, // 特殊前缀
+              key: "link_res_" + index,
               text: "[搜索结果] " + t,
-              isResult: true, // 标记一下给 AI 看
-              selector: aTag ? "" : "h3_parent" // 标记是否需要特殊处理
+              isResult: true,
+              selector: selector,
+              href: el.href?.substring(0, 100)
           });
       }
   });
 
   return {
-    text: bodyText.substring(0, 2000), // 稍微缩短一点，给 Context 留空间
-    inputs: inputList,
-    buttons: btnList.slice(0, 60) // 多给点额度
+    text: bodyText.substring(0, 2500),
+    inputs: inputList.slice(0, 30),
+    buttons: btnList.slice(0, 50),
+    url: window.location.href,
+    title: document.title
   };
 }
 
@@ -1054,72 +1115,152 @@ function analyzePageElements() {
 // ⚡️ 执行者 (加强版：支持复杂选择器)
 // ==========================================
 function executeActionPlan(action) {
-  if (action.fill) {
-    for (const [key, value] of Object.entries(action.fill)) {
-      let el = document.querySelector(`[name="${key}"], #${key}`);
-      if (!el && key.startsWith("idx_")) {
-          // 这里的 idx 逻辑其实不太稳，但在 demo 里先凑合
-          // 背景脚本里没存 idx 映射，所以这里最好是重新 query 一遍然后按顺序
-          // 但 analyzePageElements 是每一次 run loop 都跑的，所以顺序应该差不多
-          let idx = parseInt(key.split("_")[1]);
-          let all = document.querySelectorAll('input, textarea');
-          let list = [];
-          all.forEach(e => {
-            const style = window.getComputedStyle(e);
-            if (!(e.type === 'hidden' || e.type === 'submit' || e.type === 'button' || e.disabled) && style.display !== 'none') list.push(e);
-          });
-          el = list[idx];
+  const result = { success: false, details: {} };
+  
+  // 辅助函数
+  function isVisible(el) {
+      if (!el) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+  }
+  
+  function isInteractable(el) {
+      if (!el || !isVisible(el)) return false;
+      if (el.disabled) return false;
+      const rect = el.getBoundingClientRect();
+      // 检查是否在视口内
+      if (rect.bottom < 0 || rect.top > window.innerHeight) return false;
+      return true;
+  }
+  
+  // 多策略元素查找
+  function findElement(key) {
+      // 1. 直接作为选择器尝试
+      try {
+          const el = document.querySelector(key);
+          if (el && isVisible(el)) return el;
+      } catch(e) {}
+      
+      // 2. ID 匹配
+      let el = document.getElementById(key);
+      if (el && isVisible(el)) return el;
+      
+      // 3. Name 匹配
+      el = document.querySelector(`[name="${key}"]`);
+      if (el && isVisible(el)) return el;
+      
+      // 4. data-testid 匹配
+      el = document.querySelector(`[data-testid="${key}"]`);
+      if (el && isVisible(el)) return el;
+      
+      // 5. aria-label 匹配
+      el = document.querySelector(`[aria-label="${key}"]`);
+      if (el && isVisible(el)) return el;
+      
+      // 6. 文本匹配 (按钮/链接)
+      const candidates = document.querySelectorAll('button, a, input[type="submit"], [role="button"]');
+      for (const c of candidates) {
+          const text = (c.innerText || c.value || '').toLowerCase().trim();
+          if (text.includes(key.toLowerCase()) && isVisible(c)) return c;
       }
-
-      if (el) {
+      
+      // 7. 索引匹配 (兼容旧格式)
+      if (key.startsWith("idx_")) {
+          const idx = parseInt(key.split("_")[1]);
+          const all = Array.from(document.querySelectorAll('input, textarea, select')).filter(isVisible);
+          if (all[idx]) return all[idx];
+      }
+      
+      if (key.startsWith("btn_idx_")) {
+          const idx = parseInt(key.split("_")[2]);
+          const all = Array.from(document.querySelectorAll('button, input[type="submit"], [role="button"]')).filter(isVisible);
+          if (all[idx]) return all[idx];
+      }
+      
+      if (key.startsWith("link_res_")) {
+          const idx = parseInt(key.split("_")[2]);
+          const all = Array.from(document.querySelectorAll('h1 a, h2 a, h3 a')).filter(isVisible);
+          if (all[idx]) return all[idx];
+      }
+      
+      return null;
+  }
+  
+  // 填充操作
+  if (action.fill) {
+    result.details.fill = [];
+    for (const [key, value] of Object.entries(action.fill)) {
+      const el = findElement(key);
+      
+      if (el && isInteractable(el)) {
+          // 模拟真实输入
+          el.focus();
+          el.value = '';
           el.value = value;
+          
+          // 触发完整事件链
+          el.dispatchEvent(new Event('focus', { bubbles: true }));
           el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true })); // extra event
-          el.style.backgroundColor = "#e8f0fe"; 
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          el.dispatchEvent(new Event('blur', { bubbles: true }));
+          
+          // 视觉反馈
+          el.style.outline = '2px solid #4CAF50';
+          el.style.backgroundColor = '#e8f5e9';
+          
+          result.details.fill.push({ key, success: true });
+          result.success = true;
+      } else {
+          result.details.fill.push({ key, success: false, reason: el ? 'not interactable' : 'not found' });
       }
     }
   }
 
+  // 点击操作
   if (action.click) {
-      let btn = null;
+      const btn = findElement(action.click);
       
-      // A. ID/Name match
-      btn = document.getElementById(action.click) || document.querySelector(`[name="${action.click}"]`);
-      
-      // B. Link Result match (link_res_X)
-      if (!btn && action.click.startsWith("link_res_")) {
-          let idx = parseInt(action.click.split("_")[2]);
-          let allH3 = document.querySelectorAll('h3 a, h3');
-          let target = allH3[idx];
-          if (target) {
-              btn = target.tagName === 'A' ? target : target.querySelector('a');
-              if (!btn) btn = target; // Fallback to clicking H3 itself
-          }
-      }
-
-      // C. Button Index match (btn_idx_X)
-      if (!btn && action.click.startsWith("btn_idx_")) {
-         let idx = parseInt(action.click.split("_")[2]);
-         // 必须用同样的逻辑重选一遍
-         let allBtns = document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn, div[role="button"]');
-         let visibleBtns = [];
-         allBtns.forEach(b => {
-             if (b.offsetParent !== null && (b.innerText || b.value || b.title || "").trim().length > 0) visibleBtns.push(b);
-         });
-         btn = visibleBtns[idx];
-      }
-
       if (btn) {
-          console.log("点击:", btn);
-          btn.style.border = "3px solid red"; 
-          btn.style.backgroundColor = "yellow";
-          btn.scrollIntoView({ behavior: "smooth", block: "center" });
+          // 检查可交互性
+          if (!isInteractable(btn)) {
+              // 尝试滚动到视图
+              btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
           
+          console.log("🖱️ 点击:", btn);
+          
+          // 视觉高亮
+          const originalStyle = btn.style.cssText;
+          btn.style.outline = '3px solid #f44336';
+          btn.style.backgroundColor = '#ffeb3b';
+          btn.style.transition = 'all 0.2s';
+          
+          // 滚动后等待一下再点击
           setTimeout(() => {
-            btn.click();
-          }, 300); // 稍微看清楚一点再点
+              // 模拟鼠标事件链
+              btn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+              btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+              btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+              btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+              btn.click();
+              
+              // 恢复样式
+              setTimeout(() => {
+                  btn.style.cssText = originalStyle;
+              }, 500);
+          }, 350);
+          
+          result.success = true;
+          result.details.click = { target: action.click, found: true };
+      } else {
+          result.details.click = { target: action.click, found: false };
+          console.warn("⚠️ 元素未找到:", action.click);
       }
   }
+  
+  return result;
 }
 
 // ==========================================
