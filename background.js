@@ -20,7 +20,8 @@ importScripts(
     'lib/memory_manager.js',
     'lib/planner.js',
     'lib/executor.js',
-    'lib/vision.js'
+    'lib/vision.js',
+    'lib/session_memory.js' // V5 Session Memory
 );
 
 // =================全局状态=================
@@ -157,17 +158,31 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
  * 智能任务启动 - 迭代模式
  */
 async function handleSmartStart(tabId, prompt, mode) {
-    // 1. 初始化状态
+    // 0. 强制重置上一任务状态 (确保隔离)
+    await resetTaskState(tabId);
+
+    // 1. 初始化新状态
+    const effectivePrompt = prompt || "AUTONOMOUS_MODE: Analyze page and infer intent";
+    
     globalState = {
         active: true,
         tabId,
-        userGoal: prompt,
-        actionHistory: [],
+        userGoal: effectivePrompt,
+        sessionId: null, // V5: Will be set below
+        actionHistory: [], // Keep for backward compat, but use SessionMemory
+        goalStack: [],
         stepInfo: '🔍 正在分析页面...',
         waitingForLoad: false,
         lastPrompt: prompt,
+        lastPageHash: null,
         iterationCount: 0
     };
+    
+    // V5: 创建新会话
+    const tab = await chrome.tabs.get(tabId);
+    const sessionId = await self.SessionMemory.createSession(effectivePrompt, tabId, tab.url);
+    globalState.sessionId = sessionId;
+    
     saveState();
     
     // 2. 注入 Overlay
@@ -175,7 +190,7 @@ async function handleSmartStart(tabId, prompt, mode) {
     updateOverlay(tabId, globalState.stepInfo);
     
     // 3. 检查受限页面
-    const tab = await chrome.tabs.get(tabId);
+    // (tab already declared above for session creation)
     if (isRestrictedUrl(tab.url)) {
         globalState.stepInfo = '⚠️ 受限页面，无法执行自动化';
         globalState.active = false;
@@ -201,8 +216,37 @@ async function handleSmartStart(tabId, prompt, mode) {
         return;
     }
     
-    // 6. 开始迭代执行循环
-    await runIterativeLoop(tabId, prompt, apiConfig);
+    // 6. 启动看门狗 (Watchdog)
+    const watchdogInterval = setInterval(() => {
+        if (!globalState.active) {
+            clearInterval(watchdogInterval);
+            return;
+        }
+        
+        const now = Date.now();
+        const lastActive = globalState.lastActivity || now;
+        if (now - lastActive > 45000) { // 45秒无响应
+            console.error('🚨 Watchdog: Task stalled, forcing restart step...');
+            clearInterval(watchdogInterval);
+            
+            // 尝试恢复或报错
+            globalState.stepInfo = '⚠️ 任务响应超时，正在尝试自动恢复...';
+            saveState();
+            updateOverlay(tabId, globalState.stepInfo);
+            
+            // 简单策略：重置 lastActivity 并让循环继续（如果不卡死），或者强制抛错
+            // 如果 runIterativeLoop 里的 await 卡死，这里也救不了，除非我们重启 loop
+            // 但如果 JS 线程卡死，interval 也不跑。通常是 await fetch 卡住。
+            // 最好是把 fetch 加上 timeout。
+        }
+    }, 5000);
+    
+    // 7. 开始迭代执行循环
+    try {
+        await runIterativeLoop(tabId, prompt, apiConfig);
+    } finally {
+        clearInterval(watchdogInterval);
+    }
 }
 
 /**
@@ -213,8 +257,12 @@ async function runIterativeLoop(tabId, userGoal, apiConfig) {
     const userMemoryData = await chrome.storage.local.get('userMemory');
     const userMemory = parseUserMemory(userMemoryData.userMemory || '');
     
+    // 初始化活跃时间
+    globalState.lastActivity = Date.now();
+    
     while (globalState.active && globalState.iterationCount < MAX_ITERATIONS) {
         globalState.iterationCount++;
+        globalState.lastActivity = Date.now(); // Update heartbeat
         
         try {
             // 1. 等待页面稳定
@@ -257,8 +305,24 @@ async function runIterativeLoop(tabId, userGoal, apiConfig) {
                 actionHistory: globalState.actionHistory,
                 memory,
                 apiConfig,
-                tabId  // 传递 tabId 用于流式思考显示
+                memory,
+                apiConfig,
+                memory,
+                apiConfig,
+                tabId,  // 传递 tabId 用于流式思考显示
+                goalStack: globalState.goalStack || [], // Cognitive State
+                previousPageHash: globalState.lastPageHash // 🌟 Mechanical Guard
             });
+            
+            // 更新认知状态
+            if (planResult.updatedGoalStack) {
+                globalState.goalStack = planResult.updatedGoalStack;
+            }
+            
+            // 更新页面指纹
+            if (pageData.contentHash) {
+                globalState.lastPageHash = pageData.contentHash;
+            }
             
             // 7. 检查是否完成
             if (planResult.goalCompleted) {
@@ -283,6 +347,56 @@ async function runIterativeLoop(tabId, userGoal, apiConfig) {
             const step = planResult.nextStep;
             const resolvedStep = self.Planner.resolveStepPlaceholders(step, userMemory);
             
+            // 🛡️ V4: Repetition Detector
+            const recentActions = globalState.actionHistory.slice(-3);
+            const isDuplicate = recentActions.filter(a => 
+                a.action === resolvedStep.action && a.target === resolvedStep.target
+            ).length >= 2;
+            
+            if (isDuplicate) {
+                console.warn('🔁 Repetition Detected: Same action+target 3 times. Forcing rethink.');
+                updateOverlay(tabId, '⚠️ 检测到重复操作，尝试不同策略...');
+                
+                // 在 history 中标记循环，让下一轮 AI 知道
+                globalState.actionHistory.push({
+                    step: globalState.iterationCount,
+                    action: 'SYSTEM_LOOP_DETECTED',
+                    target: null,
+                    description: `Repeated action blocked: ${resolvedStep.action} on ${resolvedStep.target}`,
+                    success: false,
+                    error: 'Loop prevention triggered'
+                });
+                
+                // Skip to next iteration without executing
+                continue;
+            }
+            
+            // 记录执行前的页面指纹
+            const beforeHash = pageData.contentHash;
+            
+            // 9.5 解析虚拟 Key (例如 ai_1, ai_2) 为真实 CSS 选择器
+            // AI 现在返回 interactiveMap 中的 Key (ai-id)
+            const targetKey = resolvedStep.target;
+            if (targetKey && pageData.interactiveMap && pageData.interactiveMap[targetKey]) {
+                const realSelector = pageData.interactiveMap[targetKey];
+                console.log(`🔄 Resolving AI ID '${targetKey}' -> '${realSelector}'`);
+                resolvedStep.target = realSelector;
+            } else if (targetKey && (pageData.inputs || pageData.buttons)) {
+                // 兼容旧版逻辑 (Run safe fallback)
+                let realSelector = null;
+                const matchedInput = pageData.inputs?.find(i => i.key === targetKey);
+                if (matchedInput?.selector) realSelector = matchedInput.selector;
+                
+                if (!realSelector) {
+                    const matchedButton = pageData.buttons?.find(b => b.key === targetKey);
+                    if (matchedButton?.selector) realSelector = matchedButton.selector;
+                }
+                
+                if (realSelector) {
+                    resolvedStep.target = realSelector;
+                }
+            }
+            
             updateOverlay(tabId, `⚡️ [${globalState.iterationCount}] ${resolvedStep.description}`);
             globalState.stepInfo = `⚡️ ${resolvedStep.description}`;
             saveState();
@@ -294,15 +408,68 @@ async function runIterativeLoop(tabId, userGoal, apiConfig) {
                 pageUrl: tab.url
             });
             
-            // 11. 记录历史
+            // 11. 记录历史 (V4: Rich Feedback)
+            // 重新获取页面状态计算 afterHash
+            let afterHash = beforeHash;
+            try {
+                const postPageData = await analyzePage(tabId);
+                afterHash = postPageData.contentHash || beforeHash;
+            } catch(e) { /* 忽略 */ }
+            
+            const stateChange = beforeHash !== afterHash ? 'PAGE_CHANGED' : 'PAGE_SAME';
+            
+            // 🆕 检查是否出现错误/成功消息 (让 AI 感知验证结果)
+            let pageMessage = null;
+            try {
+                const msgCheck = await chrome.scripting.executeScript({
+                    target: { tabId },
+                    func: () => {
+                        // 查找常见的消息元素
+                        const selectors = [
+                            '.error', '.alert-error', '.alert-danger', '.message-error',
+                            '.success', '.alert-success', '.message-success',
+                            '[role="alert"]', '[role="status"]',
+                            '.feedback', '.validation-message', '.form-error'
+                        ];
+                        for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el && el.innerText?.trim()) {
+                                return el.innerText.trim().substring(0, 100);
+                            }
+                        }
+                        return null;
+                    }
+                });
+                pageMessage = msgCheck[0]?.result;
+            } catch(e) { /* ignore */ }
+            
+            // 构建丰富的状态反馈
+            let richStateChange = stateChange;
+            if (pageMessage) {
+                richStateChange = `${stateChange} | PAGE_MESSAGE: "${pageMessage}"`;
+            }
+            
             globalState.actionHistory.push({
                 step: globalState.iterationCount,
                 action: resolvedStep.action,
                 target: resolvedStep.target,
                 description: resolvedStep.description,
                 success: stepResult.success,
+                error: stepResult.error,
+                stateChange: richStateChange // 🌟 Enhanced Feedback
+            });
+            
+            // V5: Persist to SessionMemory
+            await self.SessionMemory.addStep(globalState.sessionId, {
+                action: resolvedStep.action,
+                target: resolvedStep.target,
+                value: resolvedStep.value,
+                description: resolvedStep.description,
+                result: stateChange,
+                success: stepResult.success,
                 error: stepResult.error
             });
+            
             saveState();
             
             // 12. 处理执行结果
@@ -379,6 +546,39 @@ async function runIterativeLoop(tabId, userGoal, apiConfig) {
 }
 
 /**
+ * 重置任务状态 (隔离旧记忆)
+ */
+async function resetTaskState(tabId) {
+    console.log('🧹 Cleaning up previous task state...');
+    
+    // 停止当前活动
+    globalState.active = false;
+    globalState.waitingForLoad = false;
+    
+    // 清除所有报警器/计时器
+    await chrome.alarms.clearAll();
+    
+    // 如果有之前的 Overlay，尝试清除或更新状态
+    if (tabId) {
+        // 通知清除旧的思考内容
+        chrome.tabs.sendMessage(tabId, { type: 'AI_THINKING_CLEAR' }).catch(() => {});
+    }
+
+    // 确保 globalState 被完全重置（虽然会被覆盖，这里做深度清理）
+    globalState = {
+        active: false,
+        tabId: null,
+        task: null,
+        currentStepIndex: 0,
+        stepInfo: '🚀 扩展已就绪',
+        waitingForLoad: false,
+        lastPrompt: ''
+    };
+    
+    await saveState();
+}
+
+/**
  * 等待页面稳定
  */
 async function waitForPageStable(tabId, timeout = 3000) {
@@ -433,86 +633,56 @@ function isRestrictedUrl(url) {
  * 分析页面元素
  */
 async function analyzePage(tabId) {
-    const result = await chrome.scripting.executeScript({
+    let result = await chrome.scripting.executeScript({
         target: { tabId },
         func: analyzePageElements
     });
-    return result[0]?.result || { text: '', inputs: [], buttons: [] };
+    
+    let data = result[0]?.result;
+    
+    // 如果 SnapshotGenerator 未加载，注入并重试
+    if (data && data.error === 'SnapshotGenerator not loaded') {
+        console.log('🔧 Injecting dom_tools.js for SnapshotGenerator...');
+        await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['lib/dom_tools.js']
+        });
+        
+        // Retry
+        result = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: analyzePageElements
+        });
+        data = result[0]?.result;
+    }
+
+    return data || { domTree: '', interactiveMap: {}, text: '', inputs: [], buttons: [] };
 }
 
 /**
  * 页面元素分析函数（注入到页面）
  */
+/**
+ * 页面元素分析函数（注入到页面）
+ */
 function analyzePageElements() {
-    const bodyText = document.body?.innerText || '';
-    
-    function isVisible(el) {
-        if (!el) return false;
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
+    // 确保工具已加载
+    if (!window.SnapshotGenerator) {
+        return { error: 'SnapshotGenerator not loaded' };
     }
     
-    function buildSelector(el) {
-        if (!el) return null;
-        const testId = el.getAttribute('data-testid') || el.getAttribute('data-test');
-        if (testId) return `[data-testid="${testId}"]`;
-        if (el.id) return `#${el.id}`;
-        if (el.name) return `[name="${el.name}"]`;
-        const ariaLabel = el.getAttribute('aria-label');
-        if (ariaLabel) return `[aria-label="${ariaLabel}"]`;
-        let sel = el.tagName.toLowerCase();
-        if (el.className && typeof el.className === 'string') {
-            const classes = el.className.split(/\s+/).filter(c => c && !c.includes(':'));
-            if (classes.length > 0) sel += '.' + classes.slice(0, 2).join('.');
-        }
-        return sel;
+    const snapshot = window.SnapshotGenerator.generateSnapshot();
+    
+    // 序列化 interactiveMap (只保留 selector)
+    const map = {};
+    for (const [key, value] of Object.entries(snapshot.interactiveMap)) {
+        map[key] = value.selector;
     }
-    
-    // 收集输入框
-    const inputList = [];
-    document.querySelectorAll('input, textarea, select').forEach(el => {
-        if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button') return;
-        if (!isVisible(el)) return;
-        inputList.push({
-            key: el.name || el.id || `idx_${inputList.length}`,
-            placeholder: el.placeholder || '',
-            label: el.previousElementSibling?.innerText?.substring(0, 30) || '',
-            type: el.type || el.tagName.toLowerCase(),
-            selector: buildSelector(el),
-            disabled: el.disabled,
-            value: el.value?.substring(0, 20) || ''
-        });
-    });
-    
-    // 收集按钮
-    const btnList = [];
-    const seenElements = new WeakSet();
-    
-    ['button:not([disabled])', 'input[type="submit"]', '[role="button"]', 'a[href]'].forEach(sel => {
-        document.querySelectorAll(sel).forEach(el => {
-            if (seenElements.has(el) || !isVisible(el)) return;
-            seenElements.add(el);
-            
-            const text = (el.innerText || el.value || el.title || el.getAttribute('aria-label') || '')
-                .substring(0, 30).replace(/\n/g, ' ').trim();
-            if (!text) return;
-            
-            btnList.push({
-                key: el.id || el.name || buildSelector(el) || `btn_${btnList.length}`,
-                text,
-                tagName: el.tagName,
-                selector: buildSelector(el),
-                type: el.type || el.getAttribute('role') || 'link'
-            });
-        });
-    });
     
     return {
-        text: bodyText.substring(0, 2500),
-        inputs: inputList.slice(0, 30),
-        buttons: btnList.slice(0, 50),
+        domTree: snapshot.domTree, // 伪HTML树字符串
+        interactiveMap: map,       // ai_id -> selector
+        contentHash: snapshot.contentHash, // 🌟 State Hash
         url: window.location.href,
         title: document.title
     };

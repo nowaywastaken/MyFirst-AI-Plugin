@@ -120,12 +120,14 @@ document.addEventListener('DOMContentLoaded', () => {
       const MAX_PROMPT_LENGTH = 2000;
       const prompt = userPrompt.value.trim();
       
-      if (!prompt) {
-        statusDiv.innerText = i18n("errorEnterCommand");
-        writeBtn.style.backgroundColor = "#34C759";
-        writeBtn.innerText = i18n("btnStartAITask") || "🚀 Start";
-        return;
-      }
+      // if (!prompt) {
+      //   statusDiv.innerText = i18n("errorEnterCommand");
+      //   writeBtn.style.backgroundColor = "#34C759";
+      //   writeBtn.innerText = i18n("btnStartAITask") || "🚀 Start";
+      //   return;
+      // }
+      
+      // Empty prompt is allowed (Zero-Prompt Mode)
       
       if (prompt.length > MAX_PROMPT_LENGTH) {
         statusDiv.innerText = `⚠️ Prompt too long (max ${MAX_PROMPT_LENGTH} chars)`;

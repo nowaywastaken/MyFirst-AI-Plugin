@@ -1,7 +1,5 @@
 // 监听来自后台的消息
-chrome.runtime.onMessage.addListener(handleMessages);
-
-async function handleMessages(message, sender, sendResponse) {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.target !== 'offscreen') {
         return;
     }
@@ -12,7 +10,7 @@ async function handleMessages(message, sender, sendResponse) {
             .catch((error) => sendResponse({ error: error.message }));
         return true; // 保持消息通道开启以进行异步响应
     }
-}
+});
 
 async function resizeImage({ dataUrl, maxWidth, maxHeight, quality }) {
     try {
